@@ -12,19 +12,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Save Payload
-        run: echo '${{ github.event.inputs.payload }}' > apps.json
-
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Execute Okta Flow
+      - name: Save Payload
+        env:
+          PAYLOAD: ${{ github.event.inputs.payload }}
+        run: echo "$PAYLOAD" > apps.json
+
+      @name: Execute Okta Flow
         env:
           OKTA_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
           OKTA_DOMAIN: ${{ secrets.OKTA_DOMAIN }}
           AUTH_SERVER_ID: aus208la25kn1hf3M0h8
         run: |
-
           APP_COUNT=$(jq '.apps | length' apps.json)
 
           for ((i=0; i<$APP_COUNT; i++)); do
@@ -58,22 +59,24 @@ jobs:
                 }
               }")
 
-            APP_ID=$(echo $CREATE | jq -r '.id')
-            CLIENT_ID=$(echo $CREATE | jq -r '.credentials.oauthClient.client_id')
-            CLIENT_SECRET=$(echo $CREATE | jq -r '.credentials.oauthClient.client_secret')
+            APP_ID=$(echo "$CREATE" | jq -r '.id')
+            CLIENT_ID=$(echo "$CREATE" | jq -r '.credentials.oauthClient.client_id')
+            CLIENT_SECRET=$(echo "$CREATE" | jq -r '.credentials.oauthClient.client_secret')
 
             echo "::add-mask::$CLIENT_SECRET"
 
-            if [ "$APP_ID" == "null" ]; then
-              echo "❌ App creation failed"
+            if [ "$APP_ID" == "null" ] || [ -z "$APP_ID" ]; then
+              echo "❌ App creation failed for $LABEL"
+              echo "$CREATE" | jq .
               exit 1
             fi
 
             echo "✅ App Created: $APP_ID"
 
             ########################################
-            # STEP 2: POSTMAN PUT CONFIG
+            # STEP 2: APPLY CONFIG (FIXED WITH CONSENT)
             ########################################
+            # Added consent_method: TRUSTED to satisfy Okta API validation
             curl -s -X PUT "$OKTA_DOMAIN/api/v1/apps/$APP_ID" \
               -H "Authorization: SSWS $OKTA_TOKEN" \
               -H "Content-Type: application/json" \
@@ -98,29 +101,33 @@ jobs:
                   \"oauthClient\": {
                     \"grant_types\": [\"client_credentials\"],
                     \"response_types\": [\"token\"],
-                    \"application_type\": \"service\"
+                    \"application_type\": \"service\",
+                    \"consent_method\": \"TRUSTED\"
                   }
                 }
-              }"
+              }" > /dev/null
 
             echo "✅ Config Applied"
 
             ########################################
             # STEP 3: CONNECT TO AUTH SERVER
             ########################################
+            # Fetching Policy ID
             POLICY_ID=$(curl -s -X GET \
               "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies" \
               -H "Authorization: SSWS $OKTA_TOKEN" \
               | jq -r '.[0].id')
 
+            # Fetching Rules
             RULES=$(curl -s -X GET \
               "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies/$POLICY_ID/rules" \
               -H "Authorization: SSWS $OKTA_TOKEN")
 
-            RULE_ID=$(echo $RULES | jq -r '.[0].id')
+            RULE_ID=$(echo "$RULES" | jq -r '.[0].id')
 
-            EXISTING=$(echo $RULES | jq '.[0].conditions.clients.include')
-            UPDATED=$(echo $EXISTING | jq ". + [\"$APP_ID\"] | unique")
+            # Updating Whitelist
+            EXISTING=$(echo "$RULES" | jq '.[0].conditions.clients.include')
+            UPDATED=$(echo "$EXISTING" | jq ". + [\"$APP_ID\"] | unique")
 
             curl -s -X PUT \
               "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies/$POLICY_ID/rules/$RULE_ID" \
@@ -136,7 +143,7 @@ jobs:
                 \"actions\": {
                   \"token\": { \"accessTokenLifetimeMinutes\": 60 }
                 }
-              }"
+              }" > /dev/null
 
             echo "🎉 DONE: $LABEL"
             echo "Client ID: $CLIENT_ID"
