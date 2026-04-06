@@ -1,0 +1,145 @@
+name: Okta App Automation
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: 'ServiceNow JSON Payload'
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Save Payload
+        run: echo '${{ github.event.inputs.payload }}' > apps.json
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Execute Okta Flow
+        env:
+          OKTA_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
+          OKTA_DOMAIN: ${{ secrets.OKTA_DOMAIN }}
+          AUTH_SERVER_ID: aus208la25kn1hf3M0h8
+        run: |
+
+          APP_COUNT=$(jq '.apps | length' apps.json)
+
+          for ((i=0; i<$APP_COUNT; i++)); do
+
+            LABEL=$(jq -r ".apps[$i].label" apps.json)
+            ROLE=$(jq -r ".apps[$i].role" apps.json)
+
+            echo "🚀 Processing: $LABEL"
+
+            ########################################
+            # STEP 1: CREATE OKTA APP
+            ########################################
+            CREATE=$(curl -s -X POST "$OKTA_DOMAIN/api/v1/apps" \
+              -H "Authorization: SSWS $OKTA_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"name\": \"oidc_client\",
+                \"label\": \"$LABEL\",
+                \"signOnMode\": \"OPENID_CONNECT\",
+                \"credentials\": {
+                  \"oauthClient\": {
+                    \"token_endpoint_auth_method\": \"client_secret_basic\"
+                  }
+                },
+                \"settings\": {
+                  \"oauthClient\": {
+                    \"application_type\": \"service\",
+                    \"grant_types\": [\"client_credentials\"],
+                    \"response_types\": [\"token\"]
+                  }
+                }
+              }")
+
+            APP_ID=$(echo $CREATE | jq -r '.id')
+            CLIENT_ID=$(echo $CREATE | jq -r '.credentials.oauthClient.client_id')
+            CLIENT_SECRET=$(echo $CREATE | jq -r '.credentials.oauthClient.client_secret')
+
+            echo "::add-mask::$CLIENT_SECRET"
+
+            if [ "$APP_ID" == "null" ]; then
+              echo "❌ App creation failed"
+              exit 1
+            fi
+
+            echo "✅ App Created: $APP_ID"
+
+            ########################################
+            # STEP 2: POSTMAN PUT CONFIG
+            ########################################
+            curl -s -X PUT "$OKTA_DOMAIN/api/v1/apps/$APP_ID" \
+              -H "Authorization: SSWS $OKTA_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"id\": \"$APP_ID\",
+                \"name\": \"oidc_client\",
+                \"label\": \"$LABEL\",
+                \"status\": \"ACTIVE\",
+                \"signOnMode\": \"OPENID_CONNECT\",
+                \"credentials\": {
+                  \"oauthClient\": {
+                    \"client_id\": \"$CLIENT_ID\",
+                    \"token_endpoint_auth_method\": \"client_secret_basic\"
+                  }
+                },
+                \"profile\": {
+                  \"access\": {
+                    \"role\": [\"$ROLE\"]
+                  }
+                },
+                \"settings\": {
+                  \"oauthClient\": {
+                    \"grant_types\": [\"client_credentials\"],
+                    \"response_types\": [\"token\"],
+                    \"application_type\": \"service\"
+                  }
+                }
+              }"
+
+            echo "✅ Config Applied"
+
+            ########################################
+            # STEP 3: CONNECT TO AUTH SERVER
+            ########################################
+            POLICY_ID=$(curl -s -X GET \
+              "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies" \
+              -H "Authorization: SSWS $OKTA_TOKEN" \
+              | jq -r '.[0].id')
+
+            RULES=$(curl -s -X GET \
+              "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies/$POLICY_ID/rules" \
+              -H "Authorization: SSWS $OKTA_TOKEN")
+
+            RULE_ID=$(echo $RULES | jq -r '.[0].id')
+
+            EXISTING=$(echo $RULES | jq '.[0].conditions.clients.include')
+            UPDATED=$(echo $EXISTING | jq ". + [\"$APP_ID\"] | unique")
+
+            curl -s -X PUT \
+              "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies/$POLICY_ID/rules/$RULE_ID" \
+              -H "Authorization: SSWS $OKTA_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"type\": \"RESOURCE_ACCESS\",
+                \"name\": \"Updated Rule\",
+                \"conditions\": {
+                  \"clients\": { \"include\": $UPDATED },
+                  \"grantTypes\": { \"include\": [\"client_credentials\"] }
+                },
+                \"actions\": {
+                  \"token\": { \"accessTokenLifetimeMinutes\": 60 }
+                }
+              }"
+
+            echo "🎉 DONE: $LABEL"
+            echo "Client ID: $CLIENT_ID"
+            echo "Issuer: $OKTA_DOMAIN/oauth2/$AUTH_SERVER_ID"
+
+          done
