@@ -20,7 +20,7 @@ jobs:
           PAYLOAD: ${{ github.event.inputs.payload }}
         run: echo "$PAYLOAD" > apps.json
 
-      @name: Execute Okta Flow
+      - name: Execute Okta Flow
         env:
           OKTA_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
           OKTA_DOMAIN: ${{ secrets.OKTA_DOMAIN }}
@@ -76,7 +76,6 @@ jobs:
             ########################################
             # STEP 2: APPLY CONFIG (FIXED WITH CONSENT)
             ########################################
-            # Added consent_method: TRUSTED to satisfy Okta API validation
             curl -s -X PUT "$OKTA_DOMAIN/api/v1/apps/$APP_ID" \
               -H "Authorization: SSWS $OKTA_TOKEN" \
               -H "Content-Type: application/json" \
@@ -112,20 +111,17 @@ jobs:
             ########################################
             # STEP 3: CONNECT TO AUTH SERVER
             ########################################
-            # Fetching Policy ID
             POLICY_ID=$(curl -s -X GET \
               "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies" \
               -H "Authorization: SSWS $OKTA_TOKEN" \
               | jq -r '.[0].id')
 
-            # Fetching Rules
             RULES=$(curl -s -X GET \
               "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies/$POLICY_ID/rules" \
               -H "Authorization: SSWS $OKTA_TOKEN")
 
             RULE_ID=$(echo "$RULES" | jq -r '.[0].id')
 
-            # Updating Whitelist
             EXISTING=$(echo "$RULES" | jq '.[0].conditions.clients.include')
             UPDATED=$(echo "$EXISTING" | jq ". + [\"$APP_ID\"] | unique")
 
