@@ -24,7 +24,7 @@ jobs:
         env:
           OKTA_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
           OKTA_DOMAIN: ${{ secrets.OKTA_DOMAIN }}
-          AUTH_SERVER_ID: aus208la25kn1hf3M0h8
+          AUTH_SERVER_ID: aus11pga1hramxRyG698
         run: |
           APP_COUNT=$(jq '.apps | length' apps.json)
 
@@ -33,7 +33,7 @@ jobs:
             LABEL=$(jq -r ".apps[$i].label" apps.json)
             ROLE=$(jq -r ".apps[$i].role" apps.json)
 
-            echo "🚀 Processing: $LABEL"
+            echo "Processing: $LABEL"
 
             ########################################
             # STEP 1: CREATE OKTA APP
@@ -66,15 +66,15 @@ jobs:
             echo "::add-mask::$CLIENT_SECRET"
 
             if [ "$APP_ID" == "null" ] || [ -z "$APP_ID" ]; then
-              echo "❌ App creation failed for $LABEL"
+              echo "App creation failed for $LABEL"
               echo "$CREATE" | jq .
               exit 1
             fi
 
-            echo "✅ App Created: $APP_ID"
+            echo "App Created: $APP_ID"
 
             ########################################
-            # STEP 2: APPLY CONFIG (FIXED WITH CONSENT)
+            # STEP 2: APPLY CONFIG
             ########################################
             curl -s -X PUT "$OKTA_DOMAIN/api/v1/apps/$APP_ID" \
               -H "Authorization: SSWS $OKTA_TOKEN" \
@@ -106,42 +106,48 @@ jobs:
                 }
               }" > /dev/null
 
-            echo "✅ Config Applied"
+            echo "Config Applied"
 
             ########################################
-            # STEP 3: CONNECT TO AUTH SERVER
+            # STEP 3: ASSIGN APP TO POLICY (IMPORTANT)
             ########################################
             POLICY_ID=$(curl -s -X GET \
               "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies" \
               -H "Authorization: SSWS $OKTA_TOKEN" \
-              | jq -r '.[0].id')
+              | jq -r '.[] | select(.name=="Domain Gateway Policy") | .id')
 
-            RULES=$(curl -s -X GET \
-              "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies/$POLICY_ID/rules" \
-              -H "Authorization: SSWS $OKTA_TOKEN")
+            if [ -z "$POLICY_ID" ] || [ "$POLICY_ID" == "null" ]; then
+              echo "Policy not found"
+              exit 1
+            fi
 
-            RULE_ID=$(echo "$RULES" | jq -r '.[0].id')
+            EXISTING_CLIENTS=$(curl -s -X GET \
+              "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies/$POLICY_ID" \
+              -H "Authorization: SSWS $OKTA_TOKEN" \
+              | jq '.conditions.clients.include')
 
-            EXISTING=$(echo "$RULES" | jq '.[0].conditions.clients.include')
-            UPDATED=$(echo "$EXISTING" | jq ". + [\"$APP_ID\"] | unique")
+            UPDATED_CLIENTS=$(echo "$EXISTING_CLIENTS" | jq ". + [\"$APP_ID\"] | unique")
 
             curl -s -X PUT \
-              "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies/$POLICY_ID/rules/$RULE_ID" \
+              "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies/$POLICY_ID" \
               -H "Authorization: SSWS $OKTA_TOKEN" \
               -H "Content-Type: application/json" \
               -d "{
-                \"type\": \"RESOURCE_ACCESS\",
-                \"name\": \"Updated Rule\",
+                \"type\": \"OAUTH_AUTHORIZATION_POLICY\",
+                \"name\": \"Domain Gateway Policy\",
                 \"conditions\": {
-                  \"clients\": { \"include\": $UPDATED },
-                  \"grantTypes\": { \"include\": [\"client_credentials\"] }
-                },
-                \"actions\": {
-                  \"token\": { \"accessTokenLifetimeMinutes\": 60 }
+                  \"clients\": {
+                    \"include\": $UPDATED_CLIENTS
+                  }
                 }
               }" > /dev/null
 
-            echo "🎉 DONE: $LABEL"
+            echo "App assigned to policy"
+
+            ########################################
+            # OUTPUT
+            ########################################
+            echo "DONE: $LABEL"
             echo "Client ID: $CLIENT_ID"
             echo "Issuer: $OKTA_DOMAIN/oauth2/$AUTH_SERVER_ID"
 
