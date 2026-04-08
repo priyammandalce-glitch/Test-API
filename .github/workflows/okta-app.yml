@@ -1,0 +1,292 @@
+name: Okta App Automation
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: 'ServiceNow JSON Payload'
+        required: true
+        default: '{"apps": [{"label": "Test App", "role": "TestRole"}]}'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Save Payload
+        env:
+          PAYLOAD: ${{ github.event.inputs.payload }}
+        run: echo "$PAYLOAD" > apps.json
+
+      - name: Execute Okta Flow
+        env:
+          OKTA_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
+          OKTA_DOMAIN: ${{ secrets.OKTA_DOMAIN }}
+          AUTH_SERVER_ID: ${{ secrets.AUTH_SERVER_ID }}
+        run: |
+          set -e  # Exit on any error
+
+          echo "========================================="
+          echo "Starting Okta App Automation"
+          echo "========================================="
+
+          ########################################
+          # STEP 0: ADD SCHEMA (SAFE - RUN EVERY TIME)
+          ########################################
+          echo "Step 0: Ensuring custom schema exists..."
+          
+          SCHEMA_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$OKTA_DOMAIN/api/v1/meta/schemas/apps/oidc_client/default" \
+            -H "Authorization: SSWS $OKTA_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "definitions": {
+                "custom": {
+                  "id": "#custom",
+                  "type": "object",
+                  "properties": {
+                    "access": {
+                      "type": "object",
+                      "properties": {
+                        "role": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }')
+
+          HTTP_CODE=$(echo "$SCHEMA_RESPONSE" | tail -n1)
+          
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "✓ Schema ensured successfully (HTTP $HTTP_CODE)"
+          else
+            echo "⚠ Schema response (HTTP $HTTP_CODE) - may already exist"
+          fi
+
+          APP_COUNT=$(jq '.apps | length' apps.json)
+          echo "Processing $APP_COUNT app(s)..."
+          echo ""
+
+          for ((i=0; i<$APP_COUNT; i++)); do
+
+            LABEL=$(jq -r ".apps[$i].label" apps.json)
+            ROLE=$(jq -r ".apps[$i].role" apps.json)
+
+            echo "========================================="
+            echo "Processing App $((i+1))/$APP_COUNT: $LABEL"
+            echo "========================================="
+
+            ########################################
+            # STEP 1: CREATE OKTA APP (DOMAIN GATEWAY APPLICATION)
+            ########################################
+            echo "Step 1: Creating Okta OIDC application..."
+            
+            CREATE_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$OKTA_DOMAIN/api/v1/apps" \
+              -H "Authorization: SSWS $OKTA_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"name\": \"oidc_client\",
+                \"label\": \"$LABEL\",
+                \"signOnMode\": \"OPENID_CONNECT\",
+                \"credentials\": {
+                  \"oauthClient\": {
+                    \"token_endpoint_auth_method\": \"client_secret_basic\"
+                  }
+                },
+                \"settings\": {
+                  \"oauthClient\": {
+                    \"application_type\": \"service\",
+                    \"grant_types\": [\"client_credentials\"],
+                    \"response_types\": [\"token\"]
+                  }
+                }
+              }")
+
+            HTTP_CODE=$(echo "$CREATE_RESPONSE" | tail -n1)
+            CREATE_BODY=$(echo "$CREATE_RESPONSE" | sed '$d')
+
+            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+              echo "✗ App creation failed (HTTP $HTTP_CODE)"
+              echo "$CREATE_BODY" | jq .
+              exit 1
+            fi
+
+            APP_ID=$(echo "$CREATE_BODY" | jq -r '.id')
+            CLIENT_ID=$(echo "$CREATE_BODY" | jq -r '.credentials.oauthClient.client_id')
+            CLIENT_SECRET=$(echo "$CREATE_BODY" | jq -r '.credentials.oauthClient.client_secret')
+
+            echo "::add-mask::$CLIENT_SECRET"
+
+            if [ "$APP_ID" == "null" ] || [ -z "$APP_ID" ]; then
+              echo "✗ Failed to extract App ID"
+              echo "$CREATE_BODY" | jq .
+              exit 1
+            fi
+
+            echo "✓ App created successfully"
+            echo "  App ID: $APP_ID"
+            echo "  Client ID: $CLIENT_ID"
+
+            ########################################
+            # STEP 2: ACTIVATE APP + ADD ROLE (MATCHING POSTMAN SCREENSHOT)
+            ########################################
+            echo ""
+            echo "Step 2: Activating app and assigning role..."
+            
+            UPDATE_RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT "$OKTA_DOMAIN/api/v1/apps/$APP_ID" \
+              -H "Authorization: SSWS $OKTA_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"id\": \"$APP_ID\",
+                \"name\": \"oidc_client\",
+                \"label\": \"$LABEL\",
+                \"status\": \"ACTIVE\",
+                \"signOnMode\": \"OPENID_CONNECT\",
+                \"credentials\": {
+                  \"oauthClient\": {
+                    \"autoKeyRotation\": true,
+                    \"client_id\": \"$CLIENT_ID\",
+                    \"token_endpoint_auth_method\": \"client_secret_basic\",
+                    \"pkce_required\": false
+                  }
+                },
+                \"profile\": {
+                  \"label\": \"$LABEL\",
+                  \"access\": {
+                    \"role\": [\"$ROLE\"]
+                  }
+                },
+                \"settings\": {
+                  \"oauthClient\": {
+                    \"client_uri\": null,
+                    \"logo_uri\": null,
+                    \"redirect_uris\": [],
+                    \"response_types\": [\"token\"],
+                    \"grant_types\": [\"client_credentials\"],
+                    \"application_type\": \"service\",
+                    \"consent_method\": \"REQUIRED\",
+                    \"issuer_mode\": \"DYNAMIC\",
+                    \"idp_initiated_login\": {
+                      \"mode\": \"DISABLED\",
+                      \"default_scope\": []
+                    },
+                    \"wildcard_redirect\": \"DISABLED\",
+                    \"dpop_bound_access_tokens\": false
+                  }
+                }
+              }")
+
+            HTTP_CODE=$(echo "$UPDATE_RESPONSE" | tail -n1)
+            UPDATE_BODY=$(echo "$UPDATE_RESPONSE" | sed '$d')
+
+            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+              echo "✗ App update failed (HTTP $HTTP_CODE)"
+              echo "$UPDATE_BODY" | jq .
+              exit 1
+            fi
+
+            echo "✓ App activated and role assigned successfully"
+            echo "  Role: $ROLE"
+
+            ########################################
+            # STEP 3: ASSIGN APP TO DOMAIN GATEWAY POLICY
+            ########################################
+            echo ""
+            echo "Step 3: Assigning app to Domain Gateway Policy..."
+            
+            # Get the policy ID
+            POLICIES_RESPONSE=$(curl -s -w "\n%{http_code}" -X GET \
+              "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies" \
+              -H "Authorization: SSWS $OKTA_TOKEN")
+
+            HTTP_CODE=$(echo "$POLICIES_RESPONSE" | tail -n1)
+            POLICIES_BODY=$(echo "$POLICIES_RESPONSE" | sed '$d')
+
+            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+              echo "✗ Failed to fetch policies (HTTP $HTTP_CODE)"
+              echo "$POLICIES_BODY" | jq .
+              exit 1
+            fi
+
+            POLICY_ID=$(echo "$POLICIES_BODY" | jq -r '.[] | select(.name=="Domain Gateway Policy") | .id')
+
+            if [ -z "$POLICY_ID" ] || [ "$POLICY_ID" == "null" ]; then
+              echo "✗ Domain Gateway Policy not found"
+              echo "Available policies:"
+              echo "$POLICIES_BODY" | jq -r '.[].name'
+              exit 1
+            fi
+
+            echo "  Policy ID: $POLICY_ID"
+
+            # Get current policy configuration
+            POLICY_RESPONSE=$(curl -s -w "\n%{http_code}" -X GET \
+              "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies/$POLICY_ID" \
+              -H "Authorization: SSWS $OKTA_TOKEN")
+
+            HTTP_CODE=$(echo "$POLICY_RESPONSE" | tail -n1)
+            POLICY_BODY=$(echo "$POLICY_RESPONSE" | sed '$d')
+
+            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+              echo "✗ Failed to fetch policy details (HTTP $HTTP_CODE)"
+              exit 1
+            fi
+
+            EXISTING=$(echo "$POLICY_BODY" | jq '.conditions.clients.include // []')
+            UPDATED=$(echo "$EXISTING" | jq ". + [\"$APP_ID\"] | unique")
+
+            # Update the policy
+            POLICY_UPDATE_RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT \
+              "$OKTA_DOMAIN/api/v1/authorizationServers/$AUTH_SERVER_ID/policies/$POLICY_ID" \
+              -H "Authorization: SSWS $OKTA_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"type\": \"OAUTH_AUTHORIZATION_POLICY\",
+                \"name\": \"Domain Gateway Policy\",
+                \"conditions\": {
+                  \"clients\": {
+                    \"include\": $UPDATED
+                  }
+                }
+              }")
+
+            HTTP_CODE=$(echo "$POLICY_UPDATE_RESPONSE" | tail -n1)
+
+            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+              echo "✗ Policy assignment failed (HTTP $HTTP_CODE)"
+              POLICY_UPDATE_BODY=$(echo "$POLICY_UPDATE_RESPONSE" | sed '$d')
+              echo "$POLICY_UPDATE_BODY" | jq .
+              exit 1
+            fi
+
+            echo "✓ App assigned to Domain Gateway Policy successfully"
+
+            ########################################
+            # OUTPUT RESULTS
+            ########################################
+            echo ""
+            echo "========================================="
+            echo "✓ COMPLETED: $LABEL"
+            echo "========================================="
+            echo "Client ID:     $CLIENT_ID"
+            echo "Client Secret: $CLIENT_SECRET"
+            echo "Token URL:     $OKTA_DOMAIN/oauth2/$AUTH_SERVER_ID/v1/token"
+            echo "========================================="
+            echo ""
+
+          done
+
+          echo "========================================="
+          echo "✓ All apps processed successfully!"
+          echo "========================================="
+
+
+
