@@ -1,0 +1,131 @@
+name: Multi-Env Universal App Offboarding
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: 'JSON Payload (ServiceNow/Postman)'
+        required: true
+
+jobs:
+  offboard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Execute Universal Offboarding
+        env:
+          # Using your exact current Repository Secret names
+          OKTA_DOMAIN: ${{ secrets.OKTA_DOMAIN }}
+          OKTA_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
+          AUTH_SERVER_ID: ${{ secrets.AUTH_SERVER_ID }}
+
+        run: |
+          set -e
+          LOG_FILE="app_offboarding_log.md"
+
+          if [ ! -f "$LOG_FILE" ]; then
+            echo "# Okta App Offboarding Log" > "$LOG_FILE"
+            echo "| Timestamp | Environment | App Label | Client ID / Entity ID | SignOn Mode | Status |" >> "$LOG_FILE"
+            echo "| :--- | :--- | :--- | :--- | :--- | :--- |" >> "$LOG_FILE"
+          fi
+
+          echo '${{ github.event.inputs.payload }}' > offboard_apps.json
+          APP_COUNT=$(jq '.apps | length' offboard_apps.json)
+
+          for ((i=0; i<$APP_COUNT; i++)); do
+            RAW_LABEL=$(jq -r ".apps[$i].label" offboard_apps.json)
+            TARGET_ENV=$(jq -r ".apps[$i].env | ascii_downcase" offboard_apps.json)
+
+            # Set up logic defaults using your active global secrets
+            DOMAIN=$OKTA_DOMAIN
+            TOKEN=$OKTA_TOKEN
+            AUTH_ID=$AUTH_SERVER_ID
+
+            # Set policy expectations and visual markers based on input flags
+            if [ "$TARGET_ENV" == "prod" ]; then
+              POLICY_NAME="Default" # Change to match your actual target policy name
+              SERVER_NAME="Production"; SUFFIX="PROD"
+            elif [ "$TARGET_ENV" == "stg" ] || [ "$TARGET_ENV" == "staging" ]; then
+              POLICY_NAME="Default"
+              SERVER_NAME="Staging"; SUFFIX="STG"
+            else
+              POLICY_NAME="Default"
+              SERVER_NAME="Development"; SUFFIX="DEV"
+            fi
+
+            FULL_LABEL="${RAW_LABEL}-${SUFFIX}"
+            echo "🔍 Processing offboarding for: $FULL_LABEL in $SERVER_NAME"
+
+            APP_DATA=$(curl -s -X GET "$DOMAIN/api/v1/apps?q=$FULL_LABEL" \
+              -H "Authorization: SSWS $TOKEN" \
+              | jq -r ".[] | select(.label==\"$FULL_LABEL\")")
+
+            APP_ID=$(echo "$APP_DATA" | jq -r '.id')
+            SIGNON_MODE=$(echo "$APP_DATA" | jq -r '.signOnMode')
+            CLIENT_ID=$(echo "$APP_DATA" | jq -r '.credentials.oauthClient.client_id // .settings.saml.entityId // .id')
+
+            if [ -z "$APP_ID" ] || [ "$APP_ID" == "null" ]; then
+              echo "⚠️ WARNING: Application '$FULL_LABEL' not found in $SERVER_NAME. Skipping..."
+              continue
+            fi
+
+            echo "🎯 Identified Application Type: $SIGNON_MODE"
+
+            # --- UNIVERSAL ASSIGNMENT CLEANUP ---
+            echo "🧹 Clearing explicit user assignments..."
+            USER_ASSIGNMENTS=$(curl -s -X GET "$DOMAIN/api/v1/apps/$APP_ID/users?limit=200" -H "Authorization: SSWS $TOKEN")
+            USER_COUNT=$(echo "$USER_ASSIGNMENTS" | jq '. | length')
+            for ((u=0; u<$USER_COUNT; u++)); do
+              USER_ID=$(echo "$USER_ASSIGNMENTS" | jq -r ".[$u].id")
+              curl -s -X DELETE "$DOMAIN/api/v1/apps/$APP_ID/users/$USER_ID" -H "Authorization: SSWS $TOKEN" > /dev/null
+            done
+
+            if [ "$SIGNON_MODE" == "OPENID_CONNECT" ]; then
+              POLICY_DATA=$(curl -s -X GET "$DOMAIN/api/v1/authorizationServers/$AUTH_ID/policies" -H "Authorization: SSWS $TOKEN" | jq -r ".[] | select(.name==\"$POLICY_NAME\")")
+              POLICY_ID=$(echo "$POLICY_DATA" | jq -r '.id')
+              
+              if [ -n "$POLICY_ID" ] && [ "$POLICY_ID" != "null" ]; then
+                POLICY_DESC=$(echo "$POLICY_DATA" | jq -r '.description // ""')
+                EXISTING=$(echo "$POLICY_DATA" | jq '.conditions.clients.include // []')
+                UPDATED=$(echo "$EXISTING" | jq "map(select(. != \"$APP_ID\"))")
+
+                curl -s -X PUT "$DOMAIN/api/v1/authorizationServers/$AUTH_ID/policies/$POLICY_ID" \
+                  -H "Authorization: SSWS $TOKEN" -H "Content-Type: application/json" \
+                  -d "{\"type\":\"OAUTH_AUTHORIZATION_POLICY\",\"name\":\"$POLICY_NAME\",\"description\":\"$POLICY_DESC\",\"conditions\":{\"clients\":{\"include\":$UPDATED}}}" > /dev/null
+                echo "✅ Surgically removed from OIDC Authorization Policy Whitelist."
+              fi
+            else
+              echo "🧹 Clearing group assignments..."
+              GROUP_ASSIGNMENTS=$(curl -s -X GET "$DOMAIN/api/v1/apps/$APP_ID/groups?limit=200" -H "Authorization: SSWS $TOKEN")
+              GROUP_COUNT=$(echo "$GROUP_ASSIGNMENTS" | jq '. | length')
+              
+              for ((g=0; g<$GROUP_COUNT; g++)); do
+                GROUP_ID=$(echo "$GROUP_ASSIGNMENTS" | jq -r ".[$g].id")
+                curl -s -X DELETE "$DOMAIN/api/v1/apps/$APP_ID/groups/$GROUP_ID" -H "Authorization: SSWS $TOKEN" > /dev/null
+              done
+              echo "✅ Removed all group access controls associated with this application."
+            fi
+
+            # --- DEACTIVATE APPLICATION ---
+            curl -s -X POST "$DOMAIN/api/v1/apps/$APP_ID/lifecycle/deactivate" \
+              -H "Authorization: SSWS $TOKEN" > /dev/null
+            echo "✅ Deactivated Application: $FULL_LABEL (Status set to INACTIVE)"
+
+            TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S')
+            echo "| $TIMESTAMP | $SERVER_NAME | $FULL_LABEL | $CLIENT_ID | $SIGNON_MODE | DEACTIVATED |" >> "$LOG_FILE"
+          done
+
+      - name: Push Universal Offboarding Log to Repository
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add app_offboarding_log.md
+          git diff --quiet && git diff --staged --quiet || (git commit -m "docs: update universal offboarding log [skip ci]" && git push)
