@@ -1,26 +1,4 @@
-name: Multi-Env Universal App Offboarding
-
-on:
-  workflow_dispatch:
-    inputs:
-      payload:
-        description: 'JSON Payload (ServiceNow/Postman)'
-        required: true
-
-jobs:
-  offboard:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Install Dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Execute Universal Offboarding
+- name: Execute Universal Offboarding
         env:
           OKTA_DOMAIN: ${{ secrets.OKTA_DOMAIN }}
           OKTA_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
@@ -63,7 +41,16 @@ jobs:
             # Fetch the raw response from Okta
             RAW_RESPONSE=$(curl -s -X GET "$DOMAIN/api/v1/apps?q=$TARGET_LABEL" -H "Authorization: SSWS $TOKEN")
 
-            # Extract an array of matching applications by exact label match
+            # --- CRITICAL: PRE-VALIDATE IF OKTA RETURNED AN ARRAY ---
+            IS_ARRAY=$(echo "$RAW_RESPONSE" | jq -r 'type == "array"' 2>/dev/null || echo "false")
+            
+            if [ "$IS_ARRAY" != "true" ]; then
+              echo "❌ ERROR: Okta API did not return a valid app list array. Response was:"
+              echo "$RAW_RESPONSE"
+              exit 1
+            fi
+
+            # Safe to use .[] now because we verified it's a valid JSON array
             MATCHING_APPS=$(echo "$RAW_RESPONSE" | jq -c "[.[] | select(.label==\"$TARGET_LABEL\")]")
             MATCH_COUNT=$(echo "$MATCHING_APPS" | jq '. | length')
 
@@ -128,10 +115,3 @@ jobs:
               echo "| $TIMESTAMP | $SERVER_NAME | $TARGET_LABEL | $CLIENT_ID | $SIGNON_MODE | DEACTIVATED |" >> "$LOG_FILE"
             done
           done
-
-      - name: Push Universal Offboarding Log to Repository
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add app_offboarding_log.md
-          git diff --quiet && git diff --staged --quiet || (git commit -m "docs: update universal offboarding log [skip ci]" && git push)
