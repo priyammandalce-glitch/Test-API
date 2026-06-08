@@ -22,7 +22,6 @@ jobs:
 
       - name: Execute Universal Offboarding
         env:
-          # Bound directly to your current Repository Secret names
           OKTA_DOMAIN: ${{ secrets.OKTA_DOMAIN }}
           OKTA_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
           AUTH_SERVER_ID: ${{ secrets.AUTH_SERVER_ID }}
@@ -43,37 +42,34 @@ jobs:
           for ((i=0; i<$APP_COUNT; i++)); do
             RAW_LABEL=$(jq -r ".apps[$i].label" offboard_apps.json)
             TARGET_ENV=$(jq -r ".apps[$i].env | ascii_downcase" offboard_apps.json)
+            TARGET_CLIENT_ID=$(jq -r ".apps[$i].client_id // empty" offboard_apps.json)
 
-            # Set up logic defaults using your active global secrets
             DOMAIN=$OKTA_DOMAIN
             TOKEN=$OKTA_TOKEN
             AUTH_ID=$AUTH_SERVER_ID
 
-            # Set policy expectations and visual markers based on input flags
             if [ "$TARGET_ENV" == "prod" ]; then
-              POLICY_NAME="Default" # Change to match your actual target policy name
-              SERVER_NAME="Production"; SUFFIX="PROD"
+              POLICY_NAME="Default"
+              SERVER_NAME="Production"
             elif [ "$TARGET_ENV" == "stg" ] || [ "$TARGET_ENV" == "staging" ]; then
               POLICY_NAME="Default"
-              SERVER_NAME="Staging"; SUFFIX="STG"
+              SERVER_NAME="Staging"
             else
               POLICY_NAME="Default"
-              SERVER_NAME="Development"; SUFFIX="DEV"
+              SERVER_NAME="Development"
             fi
 
-            FULL_LABEL="${RAW_LABEL}-${SUFFIX}"
-            echo "🔍 Processing offboarding for: $FULL_LABEL in $SERVER_NAME"
+            echo "🔍 Processing offboarding for: $RAW_LABEL in $SERVER_NAME"
 
-            # --- BULLETPROOF APP LOOKUP ENGINE ---
-            RAW_RESPONSE=$(curl -s -X GET "$DOMAIN/api/v1/apps?q=$FULL_LABEL" -H "Authorization: SSWS $TOKEN")
+            # --- DUAL-CONDITION LOOKUP ENGINE ---
+            RAW_RESPONSE=$(curl -s -X GET "$DOMAIN/api/v1/apps?q=$RAW_LABEL" -H "Authorization: SSWS $TOKEN")
 
-            # Validate payload structure to completely avoid jq indexing faults
-            if echo "$RAW_RESPONSE" | jq -e 'type == "array"' > /dev/null; then
-              APP_DATA=$(echo "$RAW_RESPONSE" | jq -r ".[] | select(.label==\"$FULL_LABEL\")")
-            elif echo "$RAW_RESPONSE" | jq -e 'type == "object"' > /dev/null; then
-              APP_DATA=$(echo "$RAW_RESPONSE" | jq -r "select(.label==\"$FULL_LABEL\")")
+            if [ -n "$TARGET_CLIENT_ID" ]; then
+              # If Client ID is provided, isolate the exact matching entity instance
+              APP_DATA=$(echo "$RAW_RESPONSE" | jq -r ".[] | select(.credentials.oauthClient.client_id==\"$TARGET_CLIENT_ID\")")
             else
-              APP_DATA=""
+              # Fallback to label match if no client_id was passed
+              APP_DATA=$(echo "$RAW_RESPONSE" | jq -r ".[] | select(.label==\"$RAW_LABEL\") | first")
             fi
 
             APP_ID=$(echo "$APP_DATA" | jq -r '.id // empty')
@@ -81,11 +77,11 @@ jobs:
             CLIENT_ID=$(echo "$APP_DATA" | jq -r '.credentials.oauthClient.client_id // .settings.saml.entityId // .id // empty')
 
             if [ -z "$APP_ID" ] || [ "$APP_ID" == "null" ]; then
-              echo "⚠️ WARNING: Application '$FULL_LABEL' not found in $SERVER_NAME. Skipping..."
+              echo "⚠️ WARNING: Application instance matching '$RAW_LABEL' ($TARGET_CLIENT_ID) not found. Skipping..."
               continue
             fi
 
-            echo "🎯 Identified Application Type: $SIGNON_MODE"
+            echo "🎯 Identified Application ID: $APP_ID (Type: $SIGNON_MODE)"
 
             # --- UNIVERSAL ASSIGNMENT CLEANUP ---
             echo "🧹 Clearing explicit user assignments..."
@@ -125,10 +121,10 @@ jobs:
             # --- DEACTIVATE APPLICATION ---
             curl -s -X POST "$DOMAIN/api/v1/apps/$APP_ID/lifecycle/deactivate" \
               -H "Authorization: SSWS $TOKEN" > /dev/null
-            echo "✅ Deactivated Application: $FULL_LABEL (Status set to INACTIVE)"
+            echo "✅ Deactivated Application: $RAW_LABEL (Status set to INACTIVE)"
 
             TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S')
-            echo "| $TIMESTAMP | $SERVER_NAME | $FULL_LABEL | $CLIENT_ID | $SIGNON_MODE | DEACTIVATED |" >> "$LOG_FILE"
+            echo "| $TIMESTAMP | $SERVER_NAME | $RAW_LABEL | $CLIENT_ID | $SIGNON_MODE | DEACTIVATED |" >> "$LOG_FILE"
           done
 
       - name: Push Universal Offboarding Log to Repository
