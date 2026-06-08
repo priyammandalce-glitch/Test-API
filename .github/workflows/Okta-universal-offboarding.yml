@@ -37,12 +37,11 @@ jobs:
           fi
 
           echo '${{ github.event.inputs.payload }}' > offboard_apps.json
-          APP_COUNT=$(jq '.apps | length' offboard_apps.json)
+          INPUT_COUNT=$(jq '.apps | length' offboard_apps.json)
 
-          for ((i=0; i<$APP_COUNT; i++)); do
-            RAW_LABEL=$(jq -r ".apps[$i].label" offboard_apps.json)
+          for ((i=0; i<$INPUT_COUNT; i++)); do
+            TARGET_LABEL=$(jq -r ".apps[$i].label" offboard_apps.json)
             TARGET_ENV=$(jq -r ".apps[$i].env | ascii_downcase" offboard_apps.json)
-            TARGET_CLIENT_ID=$(jq -r ".apps[$i].client_id // empty" offboard_apps.json)
 
             DOMAIN=$OKTA_DOMAIN
             TOKEN=$OKTA_TOKEN
@@ -59,72 +58,75 @@ jobs:
               SERVER_NAME="Development"
             fi
 
-            echo "🔍 Processing offboarding for: $RAW_LABEL in $SERVER_NAME"
+            echo "🔍 Fetching all applications matching label: $TARGET_LABEL for $SERVER_NAME"
 
-            # --- DUAL-CONDITION LOOKUP ENGINE ---
-            RAW_RESPONSE=$(curl -s -X GET "$DOMAIN/api/v1/apps?q=$RAW_LABEL" -H "Authorization: SSWS $TOKEN")
+            # Fetch the raw response from Okta
+            RAW_RESPONSE=$(curl -s -X GET "$DOMAIN/api/v1/apps?q=$TARGET_LABEL" -H "Authorization: SSWS $TOKEN")
 
-            if [ -n "$TARGET_CLIENT_ID" ]; then
-              # If Client ID is provided, isolate the exact matching entity instance
-              APP_DATA=$(echo "$RAW_RESPONSE" | jq -r ".[] | select(.credentials.oauthClient.client_id==\"$TARGET_CLIENT_ID\")")
-            else
-              # Fallback to label match if no client_id was passed
-              APP_DATA=$(echo "$RAW_RESPONSE" | jq -r ".[] | select(.label==\"$RAW_LABEL\") | first")
-            fi
+            # Extract an array of matching applications by exact label match
+            MATCHING_APPS=$(echo "$RAW_RESPONSE" | jq -c "[.[] | select(.label==\"$TARGET_LABEL\")]")
+            MATCH_COUNT=$(echo "$MATCHING_APPS" | jq '. | length')
 
-            APP_ID=$(echo "$APP_DATA" | jq -r '.id // empty')
-            SIGNON_MODE=$(echo "$APP_DATA" | jq -r '.signOnMode // empty')
-            CLIENT_ID=$(echo "$APP_DATA" | jq -r '.credentials.oauthClient.client_id // .settings.saml.entityId // .id // empty')
-
-            if [ -z "$APP_ID" ] || [ "$APP_ID" == "null" ]; then
-              echo "⚠️ WARNING: Application instance matching '$RAW_LABEL' ($TARGET_CLIENT_ID) not found. Skipping..."
+            if [ "$MATCH_COUNT" -eq 0 ]; then
+              echo "⚠️ WARNING: No application found with label '$TARGET_LABEL'. Skipping..."
               continue
             fi
 
-            echo "🎯 Identified Application ID: $APP_ID (Type: $SIGNON_MODE)"
+            echo "🎯 Found $MATCH_COUNT application(s) matching '$TARGET_LABEL'. Starting processing loop..."
 
-            # --- UNIVERSAL ASSIGNMENT CLEANUP ---
-            echo "🧹 Clearing explicit user assignments..."
-            USER_ASSIGNMENTS=$(curl -s -X GET "$DOMAIN/api/v1/apps/$APP_ID/users?limit=200" -H "Authorization: SSWS $TOKEN")
-            USER_COUNT=$(echo "$USER_ASSIGNMENTS" | jq '. | length')
-            for ((u=0; u<$USER_COUNT; u++)); do
-              USER_ID=$(echo "$USER_ASSIGNMENTS" | jq -r ".[$u].id")
-              curl -s -X DELETE "$DOMAIN/api/v1/apps/$APP_ID/users/$USER_ID" -H "Authorization: SSWS $TOKEN" > /dev/null
-            done
-
-            if [ "$SIGNON_MODE" == "OPENID_CONNECT" ]; then
-              POLICY_DATA=$(curl -s -X GET "$DOMAIN/api/v1/authorizationServers/$AUTH_ID/policies" -H "Authorization: SSWS $TOKEN" | jq -r ".[] | select(.name==\"$POLICY_NAME\")")
-              POLICY_ID=$(echo "$POLICY_DATA" | jq -r '.id')
+            # Loop through all instances found with that exact name
+            for ((m=0; m<$MATCH_COUNT; m++)); do
+              APP_DATA=$(echo "$MATCHING_APPS" | jq -r ".[$m]")
               
-              if [ -n "$POLICY_ID" ] && [ "$POLICY_ID" != "null" ]; then
-                POLICY_DESC=$(echo "$POLICY_DATA" | jq -r '.description // ""')
-                EXISTING=$(echo "$POLICY_DATA" | jq '.conditions.clients.include // []')
-                UPDATED=$(echo "$EXISTING" | jq "map(select(. != \"$APP_ID\"))")
+              APP_ID=$(echo "$APP_DATA" | jq -r '.id')
+              SIGNON_MODE=$(echo "$APP_DATA" | jq -r '.signOnMode')
+              CLIENT_ID=$(echo "$APP_DATA" | jq -r '.credentials.oauthClient.client_id // .settings.saml.entityId // .id')
 
-                curl -s -X PUT "$DOMAIN/api/v1/authorizationServers/$AUTH_ID/policies/$POLICY_ID" \
-                  -H "Authorization: SSWS $TOKEN" -H "Content-Type: application/json" \
-                  -d "{\"type\":\"OAUTH_AUTHORIZATION_POLICY\",\"name\":\"$POLICY_NAME\",\"description\":\"$POLICY_DESC\",\"conditions\":{\"clients\":{\"include\":$UPDATED}}}" > /dev/null
-                echo "✅ Surgically removed from OIDC Authorization Policy Whitelist."
-              fi
-            else
-              echo "🧹 Clearing group assignments..."
-              GROUP_ASSIGNMENTS=$(curl -s -X GET "$DOMAIN/api/v1/apps/$APP_ID/groups?limit=200" -H "Authorization: SSWS $TOKEN")
-              GROUP_COUNT=$(echo "$GROUP_ASSIGNMENTS" | jq '. | length')
-              
-              for ((g=0; g<$GROUP_COUNT; g++)); do
-                GROUP_ID=$(echo "$GROUP_ASSIGNMENTS" | jq -r ".[$g].id")
-                curl -s -X DELETE "$DOMAIN/api/v1/apps/$APP_ID/groups/$GROUP_ID" -H "Authorization: SSWS $TOKEN" > /dev/null
+              echo "⚙️ Processing App Instance ID: $APP_ID (Type: $SIGNON_MODE, Client ID: $CLIENT_ID)"
+
+              # --- UNIVERSAL ASSIGNMENT CLEANUP ---
+              echo "🧹 Clearing explicit user assignments..."
+              USER_ASSIGNMENTS=$(curl -s -X GET "$DOMAIN/api/v1/apps/$APP_ID/users?limit=200" -H "Authorization: SSWS $TOKEN")
+              USER_COUNT=$(echo "$USER_ASSIGNMENTS" | jq '. | length')
+              for ((u=0; u<$USER_COUNT; u++)); do
+                USER_ID=$(echo "$USER_ASSIGNMENTS" | jq -r ".[$u].id")
+                curl -s -X DELETE "$DOMAIN/api/v1/apps/$APP_ID/users/$USER_ID" -H "Authorization: SSWS $TOKEN" > /dev/null
               done
-              echo "✅ Removed all group access controls associated with this application."
-            fi
 
-            # --- DEACTIVATE APPLICATION ---
-            curl -s -X POST "$DOMAIN/api/v1/apps/$APP_ID/lifecycle/deactivate" \
-              -H "Authorization: SSWS $TOKEN" > /dev/null
-            echo "✅ Deactivated Application: $RAW_LABEL (Status set to INACTIVE)"
+              if [ "$SIGNON_MODE" == "OPENID_CONNECT" ]; then
+                POLICY_DATA=$(curl -s -X GET "$DOMAIN/api/v1/authorizationServers/$AUTH_ID/policies" -H "Authorization: SSWS $TOKEN" | jq -r ".[] | select(.name==\"$POLICY_NAME\")")
+                POLICY_ID=$(echo "$POLICY_DATA" | jq -r '.id')
+                
+                if [ -n "$POLICY_ID" ] && [ "$POLICY_ID" != "null" ]; then
+                  POLICY_DESC=$(echo "$POLICY_DATA" | jq -r '.description // ""')
+                  EXISTING=$(echo "$POLICY_DATA" | jq '.conditions.clients.include // []')
+                  UPDATED=$(echo "$EXISTING" | jq "map(select(. != \"$APP_ID\"))")
 
-            TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S')
-            echo "| $TIMESTAMP | $SERVER_NAME | $RAW_LABEL | $CLIENT_ID | $SIGNON_MODE | DEACTIVATED |" >> "$LOG_FILE"
+                  curl -s -X PUT "$DOMAIN/api/v1/authorizationServers/$AUTH_ID/policies/$POLICY_ID" \
+                    -H "Authorization: SSWS $TOKEN" -H "Content-Type: application/json" \
+                    -d "{\"type\":\"OAUTH_AUTHORIZATION_POLICY\",\"name\":\"$POLICY_NAME\",\"description\":\"$POLICY_DESC\",\"conditions\":{\"clients\":{\"include\":$UPDATED}}}" > /dev/null
+                  echo "✅ Surgically removed from OIDC Authorization Policy Whitelist."
+                fi
+              else
+                echo "🧹 Clearing group assignments..."
+                GROUP_ASSIGNMENTS=$(curl -s -X GET "$DOMAIN/api/v1/apps/$APP_ID/groups?limit=200" -H "Authorization: SSWS $TOKEN")
+                GROUP_COUNT=$(echo "$GROUP_ASSIGNMENTS" | jq '. | length')
+                
+                for ((g=0; g<$GROUP_COUNT; g++)); do
+                  GROUP_ID=$(echo "$GROUP_ASSIGNMENTS" | jq -r ".[$g].id")
+                  curl -s -X DELETE "$DOMAIN/api/v1/apps/$APP_ID/groups/$GROUP_ID" -H "Authorization: SSWS $TOKEN" > /dev/null
+                done
+                echo "✅ Removed all group access controls associated with this application."
+              fi
+
+              # --- DEACTIVATE APPLICATION ---
+              curl -s -X POST "$DOMAIN/api/v1/apps/$APP_ID/lifecycle/deactivate" \
+                -H "Authorization: SSWS $TOKEN" > /dev/null
+              echo "✅ Deactivated Application: $TARGET_LABEL (Instance ID: $APP_ID set to INACTIVE)"
+
+              TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S')
+              echo "| $TIMESTAMP | $SERVER_NAME | $TARGET_LABEL | $CLIENT_ID | $SIGNON_MODE | DEACTIVATED |" >> "$LOG_FILE"
+            done
           done
 
       - name: Push Universal Offboarding Log to Repository
