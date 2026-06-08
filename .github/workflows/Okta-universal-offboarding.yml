@@ -22,7 +22,7 @@ jobs:
 
       - name: Execute Universal Offboarding
         env:
-          # Using your exact current Repository Secret names
+          # Bound directly to your current Repository Secret names
           OKTA_DOMAIN: ${{ secrets.OKTA_DOMAIN }}
           OKTA_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
           AUTH_SERVER_ID: ${{ secrets.AUTH_SERVER_ID }}
@@ -64,13 +64,21 @@ jobs:
             FULL_LABEL="${RAW_LABEL}-${SUFFIX}"
             echo "🔍 Processing offboarding for: $FULL_LABEL in $SERVER_NAME"
 
-            APP_DATA=$(curl -s -X GET "$DOMAIN/api/v1/apps?q=$FULL_LABEL" \
-              -H "Authorization: SSWS $TOKEN" \
-              | jq -r ".[] | select(.label==\"$FULL_LABEL\")")
+            # --- BULLETPROOF APP LOOKUP ENGINE ---
+            RAW_RESPONSE=$(curl -s -X GET "$DOMAIN/api/v1/apps?q=$FULL_LABEL" -H "Authorization: SSWS $TOKEN")
 
-            APP_ID=$(echo "$APP_DATA" | jq -r '.id')
-            SIGNON_MODE=$(echo "$APP_DATA" | jq -r '.signOnMode')
-            CLIENT_ID=$(echo "$APP_DATA" | jq -r '.credentials.oauthClient.client_id // .settings.saml.entityId // .id')
+            # Validate payload structure to completely avoid jq indexing faults
+            if echo "$RAW_RESPONSE" | jq -e 'type == "array"' > /dev/null; then
+              APP_DATA=$(echo "$RAW_RESPONSE" | jq -r ".[] | select(.label==\"$FULL_LABEL\")")
+            elif echo "$RAW_RESPONSE" | jq -e 'type == "object"' > /dev/null; then
+              APP_DATA=$(echo "$RAW_RESPONSE" | jq -r "select(.label==\"$FULL_LABEL\")")
+            else
+              APP_DATA=""
+            fi
+
+            APP_ID=$(echo "$APP_DATA" | jq -r '.id // empty')
+            SIGNON_MODE=$(echo "$APP_DATA" | jq -r '.signOnMode // empty')
+            CLIENT_ID=$(echo "$APP_DATA" | jq -r '.credentials.oauthClient.client_id // .settings.saml.entityId // .id // empty')
 
             if [ -z "$APP_ID" ] || [ "$APP_ID" == "null" ]; then
               echo "⚠️ WARNING: Application '$FULL_LABEL' not found in $SERVER_NAME. Skipping..."
